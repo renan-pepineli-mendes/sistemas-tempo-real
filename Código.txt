@@ -1,0 +1,174 @@
+/* Resumo das mudanças e características
+Sistema de baixa criticidade
+1 - Prioridades niveladas - Todas as tarefas com prioridade 1
+2 - Alta tolerância - O alarme só vai disparar com 10 falhas
+3 - Timeouts mais lentos - Espera por novos dados por até 3s e leitura do sensor reduzida para 1s
+4 - Botão com leitura mais lenta (200ms)
+5 - Fila de amostrar aumentada de 5 para 10 posições
+*/
+
+#include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#define BTN_FAULT_PIN  4
+#define LED_OK_PIN     2
+#define LED_ERR_PIN    19
+
+// Timeouts muito mais longos (sistema relaxado e tolerante a atrasos)
+#define SEND_TIMEOUT_MS   10    // Desiste rápido de enviar se fila encher (dados não importam tanto)
+#define RECV_TIMEOUT_MS   3000  // Espera até 3 segundos antes de acusar falta de dados (antes 1s)
+#define MUTEX_TIMEOUT_MS  500   // Espera bastante para usar o contador sem estresse
+#define ALARM_TIMEOUT_MS  10000 // O alarme dá sinal de vida só a cada 10 segundos (antes 5s)
+
+QueueHandle_t sampleQueue;
+SemaphoreHandle_t semAlarm;
+SemaphoreHandle_t mtxCounter;
+
+int processed = 0;
+bool faultInjected = false;
+
+void TaskSensor(void *pv) {
+  int value;
+
+  while (true) {
+    if (!faultInjected) {
+      value = random(0, 100);
+
+      if (xQueueSend(sampleQueue, &value, pdMS_TO_TICKS(SEND_TIMEOUT_MS)) != pdTRUE) {
+        Serial.println("[SENSOR] fila cheia, amostra descartada (sem problema)");
+      }
+    } else {
+      Serial.println("[SENSOR] falha injetada, producao parada");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Lê dados mais devagar (a cada 1s)
+  }
+}
+
+void TaskProcess(void *pv) {
+  int received;
+  int failStreak = 0;
+
+  while (true) {
+    if (xQueueReceive(sampleQueue, &received, pdMS_TO_TICKS(RECV_TIMEOUT_MS)) == pdTRUE) {
+
+      if (failStreak > 0) {
+        Serial.println("[PROC] fluxo restabelecido");
+        failStreak = 0;
+      }
+
+      Serial.print("[PROC] amostra recebida: ");
+      Serial.println(received);
+
+      xSemaphoreTake(mtxCounter, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS));
+      processed++;
+      xSemaphoreGive(mtxCounter);
+
+      digitalWrite(LED_OK_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      digitalWrite(LED_OK_PIN, LOW);
+
+    } else {
+      failStreak++;
+
+      Serial.print("[PROC] timeout sem dados: ");
+      Serial.println(failStreak);
+
+      // Limiar muito mais alto. Tolerância enorme antes de tentar recuperar
+      if (failStreak == 5) { 
+        Serial.println("[PROC] recuperacao: esvaziando a fila");
+        xQueueReset(sampleQueue);
+      }
+
+      // Precisa de 10 falhas seguidas (30 segundos sem dados) para acionar o alarme
+      if (failStreak >= 10) { 
+        Serial.println("[PROC] falha persistente (muito longa), acionando o alarme");
+        xSemaphoreGive(semAlarm);
+        failStreak = 0;
+      }
+    }
+  }
+}
+
+void TaskAlarm(void *pv) {
+  while (true) {
+    if (xSemaphoreTake(semAlarm, pdMS_TO_TICKS(ALARM_TIMEOUT_MS)) == pdTRUE) {
+
+      xSemaphoreTake(mtxCounter, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS));
+      int total = processed;
+      xSemaphoreGive(mtxCounter);
+
+      Serial.print("[ALARME] cadeia interrompida. Amostras processadas: ");
+      Serial.println(total);
+
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_ERR_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        digitalWrite(LED_ERR_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(150));
+      }
+
+    } else {
+      Serial.println("[ALARME] sem eventos, sistema saudavel");
+    }
+  }
+}
+
+void TaskButton(void *pv) {
+  int lastBtn = HIGH;
+
+  while (true) {
+    int btn = digitalRead(BTN_FAULT_PIN);
+
+    if (lastBtn == HIGH && btn == LOW) {
+      faultInjected = !faultInjected;
+
+      Serial.print("[BOTAO] falha injetada: ");
+      Serial.println(faultInjected);
+
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    lastBtn = btn;
+    // Polling bem mais lento. Reação não é imediata.
+    vTaskDelay(pdMS_TO_TICKS(200)); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BTN_FAULT_PIN, INPUT_PULLUP);
+  pinMode(LED_OK_PIN, OUTPUT);
+  pinMode(LED_ERR_PIN, OUTPUT);
+
+  // Aumentamos o tamanho da fila para 10. Em sistemas não críticos, 
+  // fazer um buffer grande compensa a falta de prioridade no processamento.
+  sampleQueue = xQueueCreate(10, sizeof(int));
+  semAlarm = xSemaphoreCreateBinary();
+  mtxCounter = xSemaphoreCreateMutex();
+
+  if (!sampleQueue || !semAlarm || !mtxCounter) {
+    Serial.println("Erro ao criar fila, semaforo ou mutex.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("Sistema de BAIXA criticidade iniciado.");
+  Serial.println("Todas as tarefas tem prioridade 1 (Round-Robin).");
+
+  // ATENÇÃO AQUI: Todas as tarefas receberam prioridade 1 (Baixa)
+  // O RTOS não vai interromper uma tarefa em andamento para rodar o Alarme ou Botão.
+  xTaskCreate(TaskSensor, "Sensor", 2048, NULL, 1, NULL);
+  xTaskCreate(TaskProcess, "Process", 2048, NULL, 1, NULL);
+  xTaskCreate(TaskAlarm, "Alarm", 2048, NULL, 1, NULL);
+  xTaskCreate(TaskButton, "Button", 2048, NULL, 1, NULL);
+}
+
+void loop() {
+}
